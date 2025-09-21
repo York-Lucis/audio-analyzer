@@ -7,8 +7,17 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import librosa
 import librosa.display
 import sounddevice as sd
-import threading
-import time
+
+# --- PyTorch CUDA Check ---
+try:
+    import torch
+    cuda_available = torch.cuda.is_available()
+    device = torch.device("cuda" if cuda_available else "cpu")
+except ImportError:
+    torch = None
+    cuda_available = False
+    device = "cpu"
+
 
 class AudioAnalyzerApp:
     """
@@ -25,32 +34,37 @@ class AudioAnalyzerApp:
         self.filepath = None
         self.audio_data = None
         self.sample_rate = None
-        self.active_plot_func = self.plot_waveform # Keep track of the current plot
+        self.active_plot_func = self.plot_waveform
+        self.n_fft = 2048 # Window size for live analysis
 
         # --- Playback and Animation control ---
-        self.playback_thread = None
+        self.stream = None
         self.is_playing = False
         self.is_paused = False
         self.current_frame = 0
         self.animation_job = None
 
         # --- Plotting objects ---
-        self.playhead_line = None
         self.dynamic_line = None
         self.plot_x_data = None
         self.plot_y_data = None
+        self.plot_cache = {}
         
         # --- UI Elements ---
         self.main_frame = tk.Frame(self.master, bg="#f0f0f0")
         self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        # File selection
-        self.file_frame = tk.Frame(self.main_frame, bg="#f0f0f0")
-        self.file_frame.pack(pady=10)
-        self.select_button = tk.Button(self.file_frame, text="Select Audio File", command=self.select_file, font=("Helvetica", 12))
+        # File selection and CUDA status
+        self.top_frame = tk.Frame(self.main_frame, bg="#f0f0f0")
+        self.top_frame.pack(pady=10, fill=tk.X)
+        self.select_button = tk.Button(self.top_frame, text="Select Audio File", command=self.select_file, font=("Helvetica", 12))
         self.select_button.pack(side=tk.LEFT, padx=5)
-        self.file_label = tk.Label(self.file_frame, text="No file selected", font=("Helvetica", 10), bg="#f0f0f0", width=60, anchor='w')
+        self.file_label = tk.Label(self.top_frame, text="No file selected", font=("Helvetica", 10), bg="#f0f0f0", width=60, anchor='w')
         self.file_label.pack(side=tk.LEFT, padx=5)
+        
+        if cuda_available:
+            self.cuda_label = tk.Label(self.top_frame, text="CUDA AVAILABLE", font=("Helvetica", 10, "bold"), fg="green", bg="#f0f0f0")
+            self.cuda_label.pack(side=tk.RIGHT, padx=10)
         
         # --- Playback controls ---
         self.playback_frame = tk.Frame(self.main_frame, bg="#f0f0f0")
@@ -109,6 +123,7 @@ class AudioAnalyzerApp:
             try:
                 self.filepath = filepath
                 self.file_label.config(text=self.filepath.split('/')[-1])
+                self.plot_cache.clear()
                 self.load_audio()
                 for button in [self.waveform_button, self.spectrum_button, self.psd_button, self.spectrogram_button, self.chromagram_button, self.tempogram_button, self.tonnetz_button, self.play_pause_button, self.stop_button]:
                     button.config(state=tk.NORMAL)
@@ -135,15 +150,18 @@ class AudioAnalyzerApp:
     def clear_plot(self):
         self.fig.clear()
         self.ax = self.fig.add_subplot(111)
-        self.playhead_line = None
         self.dynamic_line = None
         self.canvas.draw()
         
-    def _draw_static_plot(self, plot_function, *args, **kwargs):
-        """Template for drawing a full, static plot."""
+    def _get_plot_data(self, plot_key, calculation_func):
+        if plot_key not in self.plot_cache:
+            self.plot_cache[plot_key] = calculation_func()
+        return self.plot_cache[plot_key]
+
+    def _draw_static_plot(self, plot_function):
         self._internal_stop_playback_only()
         self.clear_plot()
-        plot_function(*args, **kwargs)
+        plot_function()
         self.canvas.draw()
         
     def plot_waveform(self):
@@ -157,163 +175,249 @@ class AudioAnalyzerApp:
             ))
 
     def plot_spectrum(self):
-        messagebox.showinfo("Playback Info", "Real-time playback is not applicable to frequency-domain graphs. The full spectrum will be shown.")
         if self.audio_data is not None:
             self.active_plot_func = self.plot_spectrum
             self._draw_static_plot(lambda: (
-                n := len(self.audio_data),
-                T := 1.0 / self.sample_rate,
-                yf := np.fft.fft(self.audio_data),
+                n := len(self.audio_data), T := 1.0 / self.sample_rate,
+                yf := np.fft.fft(self.audio_data), 
                 xf := np.fft.fftfreq(n, T)[:n//2],
-                self.ax.plot(xf, 2.0/n * np.abs(yf[0:n//2])),
-                self.ax.set_title("Frequency Spectrum"),
-                self.ax.set_xlabel("Frequency (Hz)"),
-                self.ax.set_ylabel("Amplitude"),
-                self.ax.grid()
+                y_data := 2.0/n * np.abs(yf[0:n//2]),
+                self.plot_cache.update({'spectrum_ymax': np.max(y_data) * 1.1}),
+                self.ax.plot(xf, y_data),
+                self.ax.set_title("Frequency Spectrum (Entire Audio)"), self.ax.set_xlabel("Frequency (Hz)"),
+                self.ax.set_ylabel("Amplitude"), self.ax.grid()
             ))
 
     def plot_psd(self):
-        messagebox.showinfo("Playback Info", "Real-time playback is not applicable to frequency-domain graphs. The full Power Spectral Density will be shown.")
         if self.audio_data is not None:
             self.active_plot_func = self.plot_psd
-            self._draw_static_plot(lambda: (
-                self.ax.psd(self.audio_data, Fs=self.sample_rate, NFFT=2048),
-                self.ax.set_title("Power Spectral Density"),
-                self.ax.set_xlabel("Frequency (Hz)"),
+            def do_plot():
+                psd_data, freqs = self.ax.psd(self.audio_data, Fs=self.sample_rate, NFFT=self.n_fft)
+                self.plot_cache.update({'psd_ymax': np.max(psd_data), 'psd_ymin': np.min(psd_data)})
+                self.ax.set_title("Power Spectral Density (Entire Audio)")
+                self.ax.set_xlabel("Frequency (Hz)")
                 self.ax.set_ylabel("Power/Frequency (dB/Hz)")
-            ))
+            self._draw_static_plot(do_plot)
             
     def plot_spectrogram(self):
         if self.audio_data is not None:
             self.active_plot_func = self.plot_spectrogram
+            data = self._get_plot_data('spectrogram', lambda: librosa.amplitude_to_db(np.abs(librosa.stft(self.audio_data)), ref=np.max))
             self._draw_static_plot(lambda: (
-                D := librosa.stft(self.audio_data),
-                S_db := librosa.amplitude_to_db(np.abs(D), ref=np.max),
-                img := librosa.display.specshow(S_db, sr=self.sample_rate, x_axis='time', y_axis='log', ax=self.ax),
+                img := librosa.display.specshow(data, sr=self.sample_rate, x_axis='time', y_axis='log', ax=self.ax),
                 self.fig.colorbar(img, ax=self.ax, format='%+2.0f dB', label='Intensity'),
-                self.ax.set_title('Spectrogram'),
-                self.ax.set_xlabel("Time (s)"),
-                self.ax.set_ylabel("Frequency (Hz)")
+                self.ax.set_title('Spectrogram'), self.ax.set_xlabel("Time (s)"), self.ax.set_ylabel("Frequency (Hz)")
             ))
 
     def plot_chromagram(self):
         if self.audio_data is not None:
             self.active_plot_func = self.plot_chromagram
+            data = self._get_plot_data('chromagram', lambda: librosa.feature.chroma_stft(y=self.audio_data, sr=self.sample_rate))
             self._draw_static_plot(lambda: (
-                chroma := librosa.feature.chroma_stft(y=self.audio_data, sr=self.sample_rate),
-                img := librosa.display.specshow(chroma, y_axis='chroma', x_axis='time', ax=self.ax, sr=self.sample_rate),
+                img := librosa.display.specshow(data, y_axis='chroma', x_axis='time', ax=self.ax, sr=self.sample_rate),
                 self.fig.colorbar(img, ax=self.ax, label='Intensity'),
-                self.ax.set_title('Chromagram'),
-                self.ax.set_xlabel("Time (s)"),
-                self.ax.set_ylabel("Pitch Class")
+                self.ax.set_title('Chromagram'), self.ax.set_xlabel("Time (s)"), self.ax.set_ylabel("Pitch Class")
             ))
 
     def plot_tempogram(self):
         if self.audio_data is not None:
             self.active_plot_func = self.plot_tempogram
+            data = self._get_plot_data('tempogram', lambda: librosa.feature.tempogram(onset_envelope=librosa.onset.onset_strength(y=self.audio_data, sr=self.sample_rate), sr=self.sample_rate))
             self._draw_static_plot(lambda: (
-                onset_env := librosa.onset.onset_strength(y=self.audio_data, sr=self.sample_rate),
-                tempogram := librosa.feature.tempogram(onset_envelope=onset_env, sr=self.sample_rate),
-                img := librosa.display.specshow(tempogram, sr=self.sample_rate, x_axis='time', y_axis='tempo', ax=self.ax, cmap='magma'),
+                img := librosa.display.specshow(data, sr=self.sample_rate, x_axis='time', y_axis='tempo', ax=self.ax, cmap='magma'),
                 self.fig.colorbar(img, ax=self.ax, label='Strength'),
-                self.ax.set_title('Tempogram'),
-                self.ax.set_xlabel("Time (s)"),
-                self.ax.set_ylabel("Tempo (BPM)")
+                self.ax.set_title('Tempogram'), self.ax.set_xlabel("Time (s)"), self.ax.set_ylabel("Tempo (BPM)")
             ))
 
     def plot_tonnetz(self):
         if self.audio_data is not None:
             self.active_plot_func = self.plot_tonnetz
+            data = self._get_plot_data('tonnetz', lambda: librosa.feature.tonnetz(y=librosa.effects.harmonic(self.audio_data), sr=self.sample_rate))
             self._draw_static_plot(lambda: (
-                tonnetz := librosa.feature.tonnetz(y=librosa.effects.harmonic(self.audio_data), sr=self.sample_rate),
-                img := librosa.display.specshow(tonnetz, sr=self.sample_rate, x_axis='time', y_axis='tonnetz', ax=self.ax, cmap='coolwarm'),
+                img := librosa.display.specshow(data, sr=self.sample_rate, x_axis='time', y_axis='tonnetz', ax=self.ax, cmap='coolwarm'),
                 self.fig.colorbar(img, ax=self.ax),
                 self.ax.set_title('Tonal Centroid Network (Tonnetz)'),
-                self.ax.set_xlabel("Time (s)"),
-                self.ax.set_ylabel("Tonal Centroids")
+                self.ax.set_xlabel("Time (s)"), self.ax.set_ylabel("Tonal Centroids")
             ))
             
+    def _audio_callback(self, outdata, frames, time, status):
+        if status:
+            # Don't print underflow errors to avoid console spam
+            if status != sd.CallbackFlags.output_underflow:
+                print(status)
+        
+        if self.is_paused:
+            outdata.fill(0)
+            return
+
+        chunk_size = min(len(self.audio_data) - self.current_frame, frames)
+        chunk = self.audio_data[self.current_frame : self.current_frame + chunk_size]
+        
+        outdata[:chunk_size] = chunk.reshape(-1, 1)
+        
+        if chunk_size < frames:
+            outdata[chunk_size:] = 0
+            self.master.after(0, self.stop_playback)
+        
+        self.current_frame += chunk_size
+
     def toggle_playback(self):
-        if self.is_playing:
-            self.is_paused = not self.is_paused
-            self.play_pause_button.config(text="▶ Play" if self.is_paused else "❚❚ Pause")
-        else:
+        if not self.is_playing:
             self.is_playing = True
             self.is_paused = False
             self.play_pause_button.config(text="❚❚ Pause")
             
-            self.prepare_plot_for_animation()
-
-            self.playback_thread = threading.Thread(target=self._audio_playback_loop, daemon=True)
-            self.playback_thread.start()
-            self._update_plot_animation()
+            try:
+                self.prepare_plot_for_animation()
+                self.stream = sd.OutputStream(
+                    samplerate=self.sample_rate,
+                    channels=1,
+                    callback=self._audio_callback,
+                    blocksize=self.n_fft
+                )
+                self.stream.start()
+                self._update_plot_animation()
+            except Exception as e:
+                messagebox.showerror("Playback Error", f"Could not start audio stream.\n{e}")
+                self.stop_playback()
+        else:
+            self.is_paused = not self.is_paused
+            self.play_pause_button.config(text="▶ Play" if self.is_paused else "❚❚ Pause")
 
     def _internal_stop_playback_only(self):
-        """Stops audio and animation without redrawing the plot."""
         if self.animation_job:
             self.master.after_cancel(self.animation_job)
             self.animation_job = None
         
-        if self.is_playing:
-            self.is_playing = False
-            if self.playback_thread and self.playback_thread.is_alive():
-                 self.playback_thread.join(timeout=0.1)
-        
-        self.current_frame = 0
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+            self.stream = None
+
+        self.is_playing = False
         self.is_paused = False
+        self.current_frame = 0
         self.play_pause_button.config(text="▶ Play")
 
     def stop_playback(self):
-        """Stops playback and restores the full static plot."""
         self._internal_stop_playback_only()
-        if self.audio_data is not None:
-            self.active_plot_func()
-
-    def _audio_playback_loop(self):
-        try:
-            with sd.OutputStream(samplerate=self.sample_rate, channels=1) as stream:
-                while self.current_frame < len(self.audio_data) and self.is_playing:
-                    if not self.is_paused:
-                        remaining = len(self.audio_data) - self.current_frame
-                        chunk_size = min(2048, remaining) 
-                        chunk = self.audio_data[self.current_frame:self.current_frame + chunk_size]
-                        stream.write(chunk.astype('float32'))
-                        self.current_frame += chunk_size
-                    else:
-                        time.sleep(0.05)
-        except Exception as e:
-             self.master.after(0, lambda: messagebox.showerror("Playback Error", str(e)))
-
-        self.master.after(0, self.stop_playback)
+        if 'clip_rect' in self.plot_cache: del self.plot_cache['clip_rect']
+        if self.audio_data is not None: self.active_plot_func()
 
     def prepare_plot_for_animation(self):
-        self.clear_plot()
-        self.ax.set_xlim(0, len(self.audio_data) / self.sample_rate)
-        self.ax.set_ylim(np.min(self.audio_data), np.max(self.audio_data))
+        is_waveform = self.active_plot_func == self.plot_waveform
+        is_live_freq = self.active_plot_func in [self.plot_spectrum, self.plot_psd]
 
-        if self.active_plot_func == self.plot_waveform:
+        self.clear_plot()
+        if is_waveform:
             self.ax.set_title("Audio Waveform (Playing...)")
             self.ax.set_xlabel("Time (s)")
             self.ax.set_ylabel("Amplitude")
-            self.dynamic_line, = self.ax.plot([], [], lw=1)
-        else: 
-            self.active_plot_func()
-            self.playhead_line = self.ax.axvline(x=0, color='r', linestyle='--', zorder=10)
+            self.ax.plot(self.plot_x_data, self.plot_y_data, color='lightgrey', lw=1)
+            if self.plot_x_data is not None and len(self.plot_x_data) > 0:
+                self.ax.set_xlim(0, self.plot_x_data[-1])
+            if self.plot_y_data is not None and len(self.plot_y_data) > 0:
+                 self.ax.set_ylim(np.min(self.plot_y_data) * 1.1, np.max(self.plot_y_data) * 1.1)
+            self.dynamic_line, = self.ax.plot([], [], color='#1f77b4', lw=1.5, animated=True)
+        elif is_live_freq:
+            self.ax.grid(True)
+            if self.active_plot_func == self.plot_spectrum:
+                self.ax.set_title("Live Frequency Spectrum")
+                self.ax.set_xlabel("Frequency (Hz)"), self.ax.set_ylabel("Amplitude")
+                self.ax.set_xlim(0, self.sample_rate / 2)
+                self.ax.set_ylim(0, self.plot_cache.get('spectrum_ymax', 1))
+                xf_chunk = np.fft.fftfreq(self.n_fft, 1.0/self.sample_rate)[:self.n_fft//2]
+                self.dynamic_line, = self.ax.plot(xf_chunk, np.zeros(self.n_fft//2), lw=1, animated=True)
+            else: # PSD
+                self.ax.set_title("Live Power Spectral Density")
+                self.ax.set_xlabel("Frequency (Hz)"), self.ax.set_ylabel("Power/Frequency (dB/Hz)")
+                freqs = np.fft.fftfreq(self.n_fft, 1/self.sample_rate)[:self.n_fft//2]
+                self.ax.set_xlim(0, self.sample_rate/2)
+                self.ax.set_ylim(self.plot_cache.get('psd_ymin', -100) - 10, self.plot_cache.get('psd_ymax', 0) + 10)
+                self.dynamic_line, = self.ax.plot(freqs, np.zeros_like(freqs), lw=1, animated=True)
+        else:
+            self.active_plot_func() 
+            if self.ax.images:
+                title = self.ax.get_title().replace(" (Playing...)", "")
+                self.ax.set_title(title + " (Playing...)")
+                img = self.ax.images[0]
+                img.set_animated(True)
+                h = abs(self.ax.get_ylim()[1] - self.ax.get_ylim()[0])
+                clip_rect = plt.Rectangle((0, self.ax.get_ylim()[0]), 0, h, transform=self.ax.transData)
+                img.set_clip_path(clip_rect)
+                self.plot_cache['clip_rect'] = clip_rect
+        
+        self.canvas.draw()
+        self.plot_cache['bg'] = self.canvas.copy_from_bbox(self.ax.bbox)
 
     def _update_plot_animation(self):
-        if not self.is_playing or self.is_paused:
+        if not self.is_playing:
             return
 
-        current_time = self.current_frame / self.sample_rate
+        # Restore the cached background
+        if 'bg' in self.plot_cache:
+            self.canvas.restore_region(self.plot_cache['bg'])
 
-        if self.active_plot_func == self.plot_waveform and self.dynamic_line:
-            self.dynamic_line.set_data(self.plot_x_data[:self.current_frame], self.plot_y_data[:self.current_frame])
+        is_live_freq = self.active_plot_func in [self.plot_spectrum, self.plot_psd]
+        artist_to_draw = None
         
-        elif self.playhead_line:
-            self.playhead_line.set_xdata([current_time, current_time])
+        if self.active_plot_func == self.plot_waveform:
+            if self.dynamic_line is not None:
+                self.dynamic_line.set_data(self.plot_x_data[:self.current_frame], self.plot_y_data[:self.current_frame])
+                artist_to_draw = self.dynamic_line
+        elif is_live_freq:
+            start = self.current_frame - self.n_fft
+            end = self.current_frame
+            if start >= 0 and self.dynamic_line is not None:
+                chunk_np = self.audio_data[start:end]
+                
+                if cuda_available and torch:
+                    # --- GPU ACCELERATION with PyTorch ---
+                    chunk = torch.from_numpy(chunk_np).to(device, dtype=torch.float32)
+                    
+                    if self.active_plot_func == self.plot_spectrum:
+                        yf = torch.fft.fft(chunk)
+                        y_data = 2.0/self.n_fft * torch.abs(yf[0:self.n_fft//2])
+                    else: # PSD
+                        window = torch.hann_window(self.n_fft, device=device)
+                        chunk = chunk * window
+                        yf = torch.fft.fft(chunk)
+                        psd_data = (torch.abs(yf)**2) / (self.sample_rate * torch.sum(window**2))
+                        psd_db = 10 * torch.log10(psd_data[:self.n_fft//2])
+                    
+                    y_data_cpu = (y_data if self.active_plot_func == self.plot_spectrum else psd_db).cpu().numpy()
+                    y_data_cpu[np.isneginf(y_data_cpu)] = -200 
+                    self.dynamic_line.set_ydata(y_data_cpu)
+                else:
+                    # --- CPU fallback with NumPy ---
+                    if self.active_plot_func == self.plot_spectrum:
+                        yf = np.fft.fft(chunk_np)
+                        y_data = 2.0/self.n_fft * np.abs(yf[0:self.n_fft//2])
+                        self.dynamic_line.set_ydata(y_data)
+                    else: # PSD
+                        window = np.hanning(self.n_fft)
+                        chunk = chunk_np * window
+                        yf = np.fft.fft(chunk)
+                        psd_data = (np.abs(yf)**2) / (self.sample_rate * np.sum(window**2))
+                        psd_db = 10 * np.log10(psd_data[:self.n_fft//2])
+                        psd_db[np.isneginf(psd_db)] = -200
+                        self.dynamic_line.set_ydata(psd_db)
+                artist_to_draw = self.dynamic_line
 
-        self.canvas.draw()
-        self.animation_job = self.master.after(40, self._update_plot_animation)
+        elif 'clip_rect' in self.plot_cache and self.ax.images:
+            current_time = self.current_frame / self.sample_rate
+            self.plot_cache['clip_rect'].set_width(current_time)
+            artist_to_draw = self.ax.images[0]
+
+        # Draw and blit the updated artist
+        if artist_to_draw:
+            self.ax.draw_artist(artist_to_draw)
+            self.canvas.blit(self.ax.bbox)
+        
+        self.canvas.flush_events()
+        
+        if self.is_playing:
+            self.animation_job = self.master.after(20, self._update_plot_animation) # Faster update rate
 
     def on_closing(self):
         self._internal_stop_playback_only()
