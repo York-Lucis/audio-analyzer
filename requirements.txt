@@ -1,5 +1,6 @@
 numpy
-matplotlib
 librosa
 sounddevice
 torch
+pyqt6
+pyqtgraph
