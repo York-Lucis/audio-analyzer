@@ -1,6 +1,6 @@
 numpy
 librosa
 sounddevice
-torch
-pyqt6
 pyqtgraph
+PyQt6
+pydub
