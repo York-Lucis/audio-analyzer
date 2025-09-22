@@ -74,11 +74,12 @@ class AudioAnalyzerApp(QMainWindow):
         self.is_paused = False
         self.current_frame = 0
         self.animation_timer = QTimer()
-        self.animation_timer.setInterval(30) # ~33 FPS
+        self.animation_timer.setInterval(25) # ~40 FPS for smoother animation
         self.animation_timer.timeout.connect(self._update_plot_animation)
 
         # --- Plotting objects ---
         self.plot_cache = {}
+        self.animation_item = None
         
         # --- UI Elements ---
         self.central_widget = QWidget()
@@ -200,49 +201,92 @@ class AudioAnalyzerApp(QMainWindow):
         self.stop_button.setEnabled(False)
         self.plot_widget.clear()
 
+    def _get_plot_data(self, plot_key, calculation_func):
+        if plot_key not in self.plot_cache:
+            self.plot_cache[plot_key] = calculation_func()
+        return self.plot_cache[plot_key]
+
     def _draw_static_plot(self):
         self.plot_widget.clear()
         
-        if self.active_plot_type == 'waveform':
-            self.plot_widget.plot(self.plot_x_data, self.audio_data, pen='k')
-            self.plot_widget.setTitle("Audio Waveform")
-            self.plot_widget.setLabel('bottom', "Time (s)")
-            self.plot_widget.setLabel('left', "Amplitude")
-        elif self.active_plot_type == 'spectrum':
-            n = len(self.audio_data)
-            yf = np.fft.fft(self.audio_data)
-            xf = np.fft.fftfreq(n, 1/self.sample_rate)[:n//2]
-            y_data = 2.0/n * np.abs(yf[0:n//2])
-            self.plot_widget.plot(xf, y_data, pen='k')
-            self.plot_widget.setTitle("Frequency Spectrum (Entire Audio)")
-            self.plot_widget.setLabel('bottom', "Frequency (Hz)")
-        elif self.active_plot_type == 'psd':
-            n = len(self.audio_data)
-            yf = np.fft.fft(self.audio_data)
-            psd_data = (np.abs(yf[0:n//2])**2) / (self.sample_rate * n)
-            freqs = np.fft.fftfreq(n, 1/self.sample_rate)[:n//2]
-            self.plot_widget.plot(freqs, 10 * np.log10(psd_data), pen='k')
-            self.plot_widget.setTitle("Power Spectral Density (Entire Audio)")
-            self.plot_widget.setLabel('bottom', "Frequency (Hz)")
-            self.plot_widget.setLabel('left', "Power/Frequency (dB/Hz)")
-        else:
-            data = None
-            if self.active_plot_type == 'spectrogram':
-                data = librosa.amplitude_to_db(np.abs(librosa.stft(self.audio_data, n_fft=self.n_fft)), ref=np.max)
-            elif self.active_plot_type == 'chromagram':
-                data = librosa.feature.chroma_stft(y=self.audio_data, sr=self.sample_rate, n_fft=self.n_fft)
-            elif self.active_plot_type == 'tempogram':
-                data = librosa.feature.tempogram(onset_envelope=librosa.onset.onset_strength(y=self.audio_data, sr=self.sample_rate), sr=self.sample_rate)
-            elif self.active_plot_type == 'tonnetz':
-                data = librosa.feature.tonnetz(y=librosa.effects.harmonic(self.audio_data), sr=self.sample_rate)
-            if data is not None:
-                img = pg.ImageItem(image=data.T)
-                self.plot_widget.addItem(img)
-                duration = len(self.audio_data) / self.sample_rate
-                img.setRect(0, 0, duration, data.shape[0])
-                self.plot_widget.setAspectLocked(False)
-                self.plot_widget.setTitle(f"{self.active_plot_type.capitalize()} (Entire Audio)")
-                self.plot_widget.setLabel('bottom', "Time (s)")
+        plot_function = getattr(self, f"_draw_{self.active_plot_type}_on_ax", None)
+        if callable(plot_function):
+            plot_function()
+        
+        self.plot_widget.autoRange()
+
+    def _draw_waveform_on_ax(self):
+        self.plot_widget.getPlotItem().setLogMode(x=False, y=False)
+        plot_item = self.plot_widget.plot(self.plot_x_data, self.audio_data, pen='k')
+        plot_item.setDownsampling(auto=True, method='peak')
+        self.plot_widget.setTitle("Audio Waveform")
+        self.plot_widget.setLabel('bottom', "Time (s)")
+        self.plot_widget.setLabel('left', "Amplitude")
+
+    def _draw_spectrum_on_ax(self):
+        n = len(self.audio_data)
+        yf = np.fft.fft(self.audio_data)
+        xf = np.fft.fftfreq(n, 1/self.sample_rate)[:n//2]
+        y_data_linear = 2.0/n * np.abs(yf[0:n//2])
+        y_data_db = 20 * np.log10(y_data_linear + 1e-9)
+        
+        self.plot_widget.getPlotItem().setLogMode(x=True, y=False)
+        self.plot_widget.plot(xf, y_data_db, pen='k')
+        self.plot_widget.setTitle("Frequency Spectrum (Entire Audio)")
+        self.plot_widget.setLabel('bottom', "Frequency (Hz)")
+        self.plot_widget.setLabel('left', "Amplitude (dB)")
+
+    def _draw_psd_on_ax(self):
+        n = len(self.audio_data)
+        yf = np.fft.fft(self.audio_data)
+        psd_data = (np.abs(yf[0:n//2])**2) / (self.sample_rate * n)
+        freqs = np.fft.fftfreq(n, 1/self.sample_rate)[:n//2]
+        
+        self.plot_widget.getPlotItem().setLogMode(x=True, y=False)
+        self.plot_widget.plot(freqs, 10 * np.log10(psd_data + 1e-9), pen='k')
+        self.plot_widget.setTitle("Power Spectral Density (Entire Audio)")
+        self.plot_widget.setLabel('bottom', "Frequency (Hz)")
+        self.plot_widget.setLabel('left', "Power/Frequency (dB/Hz)")
+
+    def _draw_spectrogram_on_ax(self):
+        data = self._get_plot_data('spectrogram', lambda: librosa.amplitude_to_db(np.abs(librosa.stft(self.audio_data, n_fft=self.n_fft)), ref=np.max))
+        img = pg.ImageItem(image=data.T)
+        self.plot_widget.addItem(img)
+        duration = len(self.audio_data) / self.sample_rate
+        img.setRect(0, 0, duration, data.shape[0])
+        self.plot_widget.setAspectLocked(False)
+        self.plot_widget.setTitle(f"Spectrogram")
+        self.plot_widget.setLabel('bottom', "Time (s)")
+
+    def _draw_chromagram_on_ax(self):
+        data = self._get_plot_data('chromagram', lambda: librosa.feature.chroma_stft(y=self.audio_data, sr=self.sample_rate, n_fft=self.n_fft))
+        img = pg.ImageItem(image=data.T)
+        self.plot_widget.addItem(img)
+        duration = len(self.audio_data) / self.sample_rate
+        img.setRect(0, 0, duration, data.shape[0])
+        self.plot_widget.setAspectLocked(False)
+        self.plot_widget.setTitle(f"Chromagram")
+        self.plot_widget.setLabel('bottom', "Time (s)")
+
+    def _draw_tempogram_on_ax(self):
+        data = self._get_plot_data('tempogram', lambda: librosa.feature.tempogram(onset_envelope=librosa.onset.onset_strength(y=self.audio_data, sr=self.sample_rate), sr=self.sample_rate))
+        img = pg.ImageItem(image=data.T)
+        self.plot_widget.addItem(img)
+        duration = len(self.audio_data) / self.sample_rate
+        img.setRect(0, 0, duration, data.shape[0])
+        self.plot_widget.setAspectLocked(False)
+        self.plot_widget.setTitle(f"Tempogram")
+        self.plot_widget.setLabel('bottom', "Time (s)")
+
+    def _draw_tonnetz_on_ax(self):
+        data = self._get_plot_data('tonnetz', lambda: librosa.feature.tonnetz(y=librosa.effects.harmonic(self.audio_data), sr=self.sample_rate))
+        img = pg.ImageItem(image=data.T)
+        self.plot_widget.addItem(img)
+        duration = len(self.audio_data) / self.sample_rate
+        img.setRect(0, 0, duration, data.shape[0])
+        self.plot_widget.setAspectLocked(False)
+        self.plot_widget.setTitle(f"Tonnetz")
+        self.plot_widget.setLabel('bottom', "Time (s)")
 
     def _audio_callback(self, outdata, frames, time_info, status):
         if status: print(status, file=sys.stderr)
@@ -254,7 +298,6 @@ class AudioAnalyzerApp(QMainWindow):
         outdata[:chunk_size, 0] = chunk
         if chunk_size < frames:
             outdata[chunk_size:, 0] = 0
-            self.main_layout.parentWidget().parent().stop_playback()
         self.current_frame += chunk_size
 
     def toggle_playback(self):
@@ -290,62 +333,60 @@ class AudioAnalyzerApp(QMainWindow):
     def prepare_plot_for_animation(self):
         self.plot_widget.clear()
         
-        if self.active_plot_type == 'waveform':
-            self.plot_widget.plot(self.plot_x_data, self.audio_data, pen=pg.mkPen(color=(200, 200, 200)))
-            self.plot_item = self.plot_widget.plot([], [], pen=pg.mkPen(color='b', width=2))
-        elif self.active_plot_type in ['spectrum', 'psd']:
+        is_live_freq_plot = self.active_plot_type in ['spectrum', 'psd']
+        is_2d_time_plot = self.active_plot_type in ['spectrogram', 'chromagram', 'tempogram', 'tonnetz']
+
+        if self.active_plot_type == 'waveform' or is_2d_time_plot:
+            # FIX: Use a playhead for all 2D time plots for performance and consistency
+            plot_function = getattr(self, f"_draw_{self.active_plot_type}_on_ax")
+            plot_function()
+            self.plot_widget.setTitle(f"{self.active_plot_type.capitalize()} (Playing...)")
+            self.animation_item = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('r', width=2))
+            self.plot_widget.addItem(self.animation_item)
+            self.animation_item.setPos(0)
+            
+        elif is_live_freq_plot:
+            xf = np.fft.fftfreq(self.n_fft, 1/self.sample_rate)[:self.n_fft//2]
+            self.animation_item = self.plot_widget.plot(xf, np.zeros(self.n_fft//2), pen='b')
+            self.plot_widget.getPlotItem().setLogMode(x=True, y=False)
+            
             if self.active_plot_type == 'spectrum':
-                xf = np.fft.fftfreq(self.n_fft, 1/self.sample_rate)[:self.n_fft//2]
-                self.plot_item = self.plot_widget.plot(xf, np.zeros(self.n_fft//2), pen='b')
-                self.plot_widget.setLogMode(x=False, y=False)
-                self.plot_widget.setYRange(0, 0.1)
+                self.plot_widget.setTitle("Live Frequency Spectrum")
+                self.plot_widget.setLabel('left', "Amplitude (dB)")
+                self.plot_widget.setYRange(-60, 20)
             else: #PSD
-                xf = np.fft.fftfreq(self.n_fft, 1/self.sample_rate)[:self.n_fft//2]
-                self.plot_item = self.plot_widget.plot(xf, np.zeros(self.n_fft//2), pen='b')
+                self.plot_widget.setTitle("Live Power Spectral Density")
+                self.plot_widget.setLabel('left', "Power/Frequency (dB/Hz)")
                 self.plot_widget.setYRange(-100, 20)
-        else: # Reveal animation for all 2D plots
-            self._draw_static_plot()
-            if self.plot_widget.allChildItems():
-                img_item = self.plot_widget.allChildItems()[0]
-                if isinstance(img_item, pg.ImageItem):
-                    original_data = img_item.image.copy()
-                    animation_data = np.full(original_data.shape, np.nanmin(original_data))
-                    img_item.setImage(animation_.data)
-                    self.plot_cache['image_artist'] = img_item
-                    self.plot_cache['original_data'] = original_data
 
     def _update_plot_animation(self):
         if not self.is_playing or self.is_paused: return
 
-        if self.active_plot_type == 'waveform':
-            self.plot_item.setData(self.plot_x_data[:self.current_frame], self.audio_data[:self.current_frame])
+        if self.current_frame >= len(self.audio_data):
+            self.stop_playback()
+            return
+            
+        current_time = self.current_frame / self.sample_rate if self.sample_rate > 0 else 0
+        
+        is_2d_time_plot = self.active_plot_type in ['spectrogram', 'chromagram', 'tempogram', 'tonnetz']
+
+        if self.active_plot_type == 'waveform' or is_2d_time_plot:
+            self.animation_item.setPos(current_time)
         elif self.active_plot_type in ['spectrum', 'psd']:
              chunk = self.audio_data[self.current_frame - self.n_fft : self.current_frame]
              if len(chunk) == self.n_fft:
+                yf = np.fft.fft(chunk)
                 if self.active_plot_type == 'spectrum':
-                    yf = np.fft.fft(chunk)
-                    y_data = 2.0/self.n_fft * np.abs(yf[0:self.n_fft//2])
+                    y_data_linear = 2.0/self.n_fft * np.abs(yf[0:self.n_fft//2])
+                    y_data = 20 * np.log10(y_data_linear + 1e-9)
                 else: #PSD
                     window = np.hanning(self.n_fft)
                     chunk = chunk * window
                     yf = np.fft.fft(chunk)
                     psd_data = (np.abs(yf)**2) / (self.sample_rate * np.sum(window**2))
-                    y_data = 10 * np.log10(psd_data[:self.n_fft//2])
-                    y_data[np.isneginf(y_data)] = -120
-                self.plot_item.setData(y=y_data)
-        else: # Reveal animation
-            if 'image_artist' in self.plot_cache:
-                img = self.plot_cache['image_artist']
-                original = self.plot_cache['original_data']
-                current_time = self.current_frame / self.sample_rate
-                duration = len(self.audio_data) / self.sample_rate
-                if duration > 0:
-                    cols_to_show = int((current_time / duration) * original.shape[1])
-                    if cols_to_show > 0:
-                        new_data = img.image
-                        new_data[:,:cols_to_show] = original[:,:cols_to_show]
-                        img.setImage(new_data, autoLevels=False)
-
+                    y_data = 10 * np.log10(psd_data[:self.n_fft//2] + 1e-9)
+                y_data[np.isneginf(y_data)] = -120
+                self.animation_item.setData(y=y_data)
 
     def closeEvent(self, event):
         self.stop_playback()
