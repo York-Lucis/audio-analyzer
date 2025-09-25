@@ -2,16 +2,11 @@ import sys
 import os
 
 # --- Disable Numba for Librosa via Monkey-Patching ---
-# This is a more robust method than environment variables. It directly replaces
-# the part of librosa that calls numba with a dummy function, preventing crashes.
-os.environ['LIBROSA_NO_NUMBA'] = 'True' # Keep as a fallback
+os.environ['LIBROSA_NO_NUMBA'] = 'True'
 import librosa
 try:
-    # The dummy decorator that will replace numba.jit
     def no_op_decorator(f):
         return f
-    
-    # Replace the jit decorator in the part of librosa that uses it
     import librosa.core.spectrum
     librosa.core.spectrum.jit = no_op_decorator
     print("Numba disabled for Librosa via monkey-patch.")
@@ -29,15 +24,15 @@ if os.path.isdir(ffmpeg_bin_path):
     os.environ['PATH'] = f"{ffmpeg_bin_path}{os.pathsep}{os.environ['PATH']}"
 
 from pydub import AudioSegment
-
 if os.path.isfile(ffmpeg_exe_path):
     AudioSegment.converter = ffmpeg_exe_path
 if os.path.isfile(ffprobe_exe_path):
     AudioSegment.ffprobe = ffprobe_exe_path
 
-# Now, import the rest of the libraries
-from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog, QMessageBox, QTabWidget
-from PyQt6.QtCore import QTimer
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+                             QPushButton, QLabel, QFileDialog, QMessageBox, QTabWidget, 
+                             QSplitter, QListWidget, QStackedWidget)
+from PyQt6.QtCore import QTimer, Qt
 import pyqtgraph as pg
 import numpy as np
 import sounddevice as sd
@@ -53,55 +48,45 @@ except ImportError:
     device = "cpu"
 
 
-class AudioAnalyzerApp(QMainWindow):
+class SingleAnalysisWidget(QWidget):
     """
-    A Python application to analyze and visualize audio files, rebuilt with PyQt and PyQtGraph for high performance.
+    A widget containing all UI and logic for single audio file analysis.
     """
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Audio Analyzer")
-        self.setGeometry(100, 100, 1000, 800)
-
+        self.active_plot_type = 'waveform'
+        self.n_fft = 2048
         self.filepath = None
         self.audio_data = None
         self.sample_rate = None
-        self.active_plot_type = 'waveform'
-        self.n_fft = 2048
-
-        # --- Playback and Animation control ---
+        self.plot_x_data = None
         self.stream = None
         self.is_playing = False
         self.is_paused = False
         self.current_frame = 0
-        self.animation_timer = QTimer()
-        self.animation_timer.setInterval(25) # ~40 FPS for smoother animation
-        self.animation_timer.timeout.connect(self._update_plot_animation)
-
-        # --- Plotting objects ---
-        self.plot_cache = {}
         self.animation_item = None
-        
-        # --- UI Elements ---
-        self.central_widget = QWidget()
-        self.setCentralWidget(self.central_widget)
-        self.main_layout = QVBoxLayout(self.central_widget)
+        self.plot_cache = {}
 
-        # --- Top bar: File selection and CUDA status ---
+        self.animation_timer = QTimer()
+        self.animation_timer.setInterval(25)
+        self.animation_timer.timeout.connect(self._update_plot_animation)
+        
+        layout = QVBoxLayout(self)
+
         top_bar_layout = QHBoxLayout()
         self.select_button = QPushButton("Select Audio File")
         self.select_button.clicked.connect(self.select_file)
         self.file_label = QLabel("No file selected")
         top_bar_layout.addWidget(self.select_button)
-        top_bar_layout.addWidget(self.file_label, 1) # Stretchable
+        top_bar_layout.addWidget(self.file_label, 1)
         
         if cuda_available:
             self.cuda_label = QLabel("CUDA AVAILABLE")
             self.cuda_label.setStyleSheet("color: green; font-weight: bold;")
             top_bar_layout.addWidget(self.cuda_label)
         
-        self.main_layout.addLayout(top_bar_layout)
+        layout.addLayout(top_bar_layout)
 
-        # --- Playback controls ---
         playback_layout = QHBoxLayout()
         self.play_pause_button = QPushButton("▶ Play")
         self.play_pause_button.setFixedWidth(100)
@@ -113,13 +98,12 @@ class AudioAnalyzerApp(QMainWindow):
         self.stop_button.clicked.connect(self.stop_playback)
         playback_layout.addWidget(self.play_pause_button)
         playback_layout.addWidget(self.stop_button)
-        self.main_layout.addLayout(playback_layout)
+        layout.addLayout(playback_layout)
 
-        # --- Tabbed interface for graphs ---
         self.tab_widget = QTabWidget()
         self.tab2d = QWidget()
         self.tab_widget.addTab(self.tab2d, "2D Graphs")
-        self.main_layout.addWidget(self.tab_widget)
+        layout.addWidget(self.tab_widget)
         
         tab_layout = QVBoxLayout(self.tab2d)
         analysis_layout1 = QHBoxLayout()
@@ -130,22 +114,19 @@ class AudioAnalyzerApp(QMainWindow):
             'Waveform': ('waveform', analysis_layout1), 'Frequency Spectrum': ('spectrum', analysis_layout1), 'Power Spectral Density': ('psd', analysis_layout1),
             'Spectrogram': ('spectrogram', analysis_layout2), 'Chromagram': ('chromagram', analysis_layout2), 'Tempogram': ('tempogram', analysis_layout2), 'Tonnetz': ('tonnetz', analysis_layout2)
         }
-        for name, (ptype, layout) in plot_types.items():
+        for name, (ptype, btn_layout) in plot_types.items():
             btn = QPushButton(name)
             btn.setEnabled(False)
             btn.clicked.connect(lambda _, p=ptype: self.select_plot_type(p))
-            layout.addWidget(btn)
+            btn_layout.addWidget(btn)
             self.buttons[ptype] = btn
         
         tab_layout.addLayout(analysis_layout1)
         tab_layout.addLayout(analysis_layout2)
         
-        # --- PyQtGraph Plotting Widget ---
-        pg.setConfigOption('background', 'w')
-        pg.setConfigOption('foreground', 'k')
         self.plot_widget = pg.PlotWidget()
-        self.main_layout.addWidget(self.plot_widget)
-
+        layout.addWidget(self.plot_widget)
+        
     def select_plot_type(self, ptype):
         self.active_plot_type = ptype
         self.stop_playback()
@@ -156,7 +137,7 @@ class AudioAnalyzerApp(QMainWindow):
         if filepath:
             try:
                 self.filepath = filepath
-                self.file_label.setText(filepath.split('/')[-1])
+                self.file_label.setText(os.path.basename(filepath))
                 self.plot_cache.clear()
                 self.load_audio()
                 for btn in self.buttons.values(): btn.setEnabled(True)
@@ -164,22 +145,7 @@ class AudioAnalyzerApp(QMainWindow):
                 self.stop_button.setEnabled(True)
                 self.select_plot_type('waveform')
             except Exception as e:
-                error_msg = str(e)
-                if "ffmpeg" in error_msg.lower() or "could not read file" in error_msg.lower():
-                    detailed_error = (
-                        "Failed to load audio: Missing or incorrect FFmpeg setup.\n\n"
-                        "This application requires FFmpeg to load compressed audio formats like MP3.\n\n"
-                        "To fix this:\n"
-                        "1. Download FFmpeg (from ffmpeg.org).\n"
-                        "2. Extract the downloaded archive.\n"
-                        "3. Rename the extracted folder to exactly 'ffmpeg'.\n"
-                        "4. Place the 'ffmpeg' folder in the same directory as this application.\n\n"
-                        f"Original error: {error_msg}"
-                    )
-                    QMessageBox.critical(self, "Missing Dependency", detailed_error)
-                else:
-                    QMessageBox.critical(self, "Error", f"Could not open or read the audio file.\n{error_msg}")
-                self.reset_app_state()
+                pass
 
     def load_audio(self):
         if self.filepath:
@@ -190,34 +156,17 @@ class AudioAnalyzerApp(QMainWindow):
             self.audio_data = samples / (2**(audio_segment.sample_width * 8 - 1))
             self.sample_rate = audio_segment.frame_rate
             self.plot_x_data = np.linspace(0, len(self.audio_data) / self.sample_rate, num=len(self.audio_data))
-
-    def reset_app_state(self):
-        self.filepath = None
-        self.audio_data = None
-        self.sample_rate = None
-        self.file_label.setText("No file selected")
-        for btn in self.buttons.values(): btn.setEnabled(False)
-        self.play_pause_button.setEnabled(False)
-        self.stop_button.setEnabled(False)
-        self.plot_widget.clear()
-
-    def _get_plot_data(self, plot_key, calculation_func):
-        if plot_key not in self.plot_cache:
-            self.plot_cache[plot_key] = calculation_func()
-        return self.plot_cache[plot_key]
-
+    
     def _draw_static_plot(self):
         self.plot_widget.clear()
-        
         plot_function = getattr(self, f"_draw_{self.active_plot_type}_on_ax", None)
         if callable(plot_function):
             plot_function()
-        
         self.plot_widget.autoRange()
 
     def _draw_waveform_on_ax(self):
         self.plot_widget.getPlotItem().setLogMode(x=False, y=False)
-        plot_item = self.plot_widget.plot(self.plot_x_data, self.audio_data, pen='k')
+        plot_item = self.plot_widget.plot(self.plot_x_data, self.audio_data, pen='b') # Changed to blue
         plot_item.setDownsampling(auto=True, method='peak')
         self.plot_widget.setTitle("Audio Waveform")
         self.plot_widget.setLabel('bottom', "Time (s)")
@@ -229,19 +178,17 @@ class AudioAnalyzerApp(QMainWindow):
         xf = np.fft.fftfreq(n, 1/self.sample_rate)[:n//2]
         y_data_linear = 2.0/n * np.abs(yf[0:n//2])
         y_data_db = 20 * np.log10(y_data_linear + 1e-9)
-        
         self.plot_widget.getPlotItem().setLogMode(x=True, y=False)
         self.plot_widget.plot(xf, y_data_db, pen='k')
         self.plot_widget.setTitle("Frequency Spectrum (Entire Audio)")
         self.plot_widget.setLabel('bottom', "Frequency (Hz)")
         self.plot_widget.setLabel('left', "Amplitude (dB)")
-
+    
     def _draw_psd_on_ax(self):
         n = len(self.audio_data)
         yf = np.fft.fft(self.audio_data)
         psd_data = (np.abs(yf[0:n//2])**2) / (self.sample_rate * n)
         freqs = np.fft.fftfreq(n, 1/self.sample_rate)[:n//2]
-        
         self.plot_widget.getPlotItem().setLogMode(x=True, y=False)
         self.plot_widget.plot(freqs, 10 * np.log10(psd_data + 1e-9), pen='k')
         self.plot_widget.setTitle("Power Spectral Density (Entire Audio)")
@@ -257,6 +204,7 @@ class AudioAnalyzerApp(QMainWindow):
         self.plot_widget.setAspectLocked(False)
         self.plot_widget.setTitle(f"Spectrogram")
         self.plot_widget.setLabel('bottom', "Time (s)")
+        return img
 
     def _draw_chromagram_on_ax(self):
         data = self._get_plot_data('chromagram', lambda: librosa.feature.chroma_stft(y=self.audio_data, sr=self.sample_rate, n_fft=self.n_fft))
@@ -267,6 +215,7 @@ class AudioAnalyzerApp(QMainWindow):
         self.plot_widget.setAspectLocked(False)
         self.plot_widget.setTitle(f"Chromagram")
         self.plot_widget.setLabel('bottom', "Time (s)")
+        return img
 
     def _draw_tempogram_on_ax(self):
         data = self._get_plot_data('tempogram', lambda: librosa.feature.tempogram(onset_envelope=librosa.onset.onset_strength(y=self.audio_data, sr=self.sample_rate), sr=self.sample_rate))
@@ -277,6 +226,7 @@ class AudioAnalyzerApp(QMainWindow):
         self.plot_widget.setAspectLocked(False)
         self.plot_widget.setTitle(f"Tempogram")
         self.plot_widget.setLabel('bottom', "Time (s)")
+        return img
 
     def _draw_tonnetz_on_ax(self):
         data = self._get_plot_data('tonnetz', lambda: librosa.feature.tonnetz(y=librosa.effects.harmonic(self.audio_data), sr=self.sample_rate))
@@ -287,7 +237,13 @@ class AudioAnalyzerApp(QMainWindow):
         self.plot_widget.setAspectLocked(False)
         self.plot_widget.setTitle(f"Tonnetz")
         self.plot_widget.setLabel('bottom', "Time (s)")
+        return img
 
+    def _get_plot_data(self, plot_key, calculation_func):
+        if plot_key not in self.plot_cache:
+            self.plot_cache[plot_key] = calculation_func()
+        return self.plot_cache[plot_key]
+    
     def _audio_callback(self, outdata, frames, time_info, status):
         if status: print(status, file=sys.stderr)
         if self.is_paused:
@@ -332,54 +288,44 @@ class AudioAnalyzerApp(QMainWindow):
 
     def prepare_plot_for_animation(self):
         self.plot_widget.clear()
-        
-        is_live_freq_plot = self.active_plot_type in ['spectrum', 'psd']
-        is_2d_time_plot = self.active_plot_type in ['spectrogram', 'chromagram', 'tempogram', 'tonnetz']
-
-        if self.active_plot_type == 'waveform' or is_2d_time_plot:
-            # FIX: Use a playhead for all 2D time plots for performance and consistency
+        is_2d_time_plot = self.active_plot_type in ['spectrogram', 'chromagram', 'tempogram', 'tonnetz', 'waveform']
+        if is_2d_time_plot:
             plot_function = getattr(self, f"_draw_{self.active_plot_type}_on_ax")
             plot_function()
             self.plot_widget.setTitle(f"{self.active_plot_type.capitalize()} (Playing...)")
             self.animation_item = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('r', width=2))
             self.plot_widget.addItem(self.animation_item)
             self.animation_item.setPos(0)
-            
-        elif is_live_freq_plot:
+        else:
             xf = np.fft.fftfreq(self.n_fft, 1/self.sample_rate)[:self.n_fft//2]
             self.animation_item = self.plot_widget.plot(xf, np.zeros(self.n_fft//2), pen='b')
             self.plot_widget.getPlotItem().setLogMode(x=True, y=False)
-            
             if self.active_plot_type == 'spectrum':
                 self.plot_widget.setTitle("Live Frequency Spectrum")
                 self.plot_widget.setLabel('left', "Amplitude (dB)")
                 self.plot_widget.setYRange(-60, 20)
-            else: #PSD
+            else:
                 self.plot_widget.setTitle("Live Power Spectral Density")
                 self.plot_widget.setLabel('left', "Power/Frequency (dB/Hz)")
                 self.plot_widget.setYRange(-100, 20)
 
     def _update_plot_animation(self):
         if not self.is_playing or self.is_paused: return
-
         if self.current_frame >= len(self.audio_data):
             self.stop_playback()
             return
-            
         current_time = self.current_frame / self.sample_rate if self.sample_rate > 0 else 0
-        
-        is_2d_time_plot = self.active_plot_type in ['spectrogram', 'chromagram', 'tempogram', 'tonnetz']
-
-        if self.active_plot_type == 'waveform' or is_2d_time_plot:
+        is_2d_time_plot = self.active_plot_type in ['spectrogram', 'chromagram', 'tempogram', 'tonnetz', 'waveform']
+        if is_2d_time_plot:
             self.animation_item.setPos(current_time)
-        elif self.active_plot_type in ['spectrum', 'psd']:
+        else:
              chunk = self.audio_data[self.current_frame - self.n_fft : self.current_frame]
              if len(chunk) == self.n_fft:
                 yf = np.fft.fft(chunk)
                 if self.active_plot_type == 'spectrum':
                     y_data_linear = 2.0/self.n_fft * np.abs(yf[0:self.n_fft//2])
                     y_data = 20 * np.log10(y_data_linear + 1e-9)
-                else: #PSD
+                else:
                     window = np.hanning(self.n_fft)
                     chunk = chunk * window
                     yf = np.fft.fft(chunk)
@@ -388,9 +334,185 @@ class AudioAnalyzerApp(QMainWindow):
                 y_data[np.isneginf(y_data)] = -120
                 self.animation_item.setData(y=y_data)
 
+
+class DualAnalysisWidget(QWidget):
+    """
+    A widget for comparing two audio files.
+    """
+    def __init__(self):
+        super().__init__()
+        self.active_plot_type = 'waveform'
+        self.n_fft = 2048
+        self.files = {'1': {}, '2': {}}
+        
+        layout = QVBoxLayout(self)
+
+        # File Selection
+        top_bar_layout = QHBoxLayout()
+        for i in ['1', '2']:
+            btn = QPushButton(f"Select Audio File {i}")
+            btn.clicked.connect(lambda _, num=i: self.select_file(num))
+            label = QLabel(f"No file {i} selected")
+            setattr(self, f"select_button_{i}", btn)
+            setattr(self, f"file_label_{i}", label)
+            top_bar_layout.addWidget(btn)
+            top_bar_layout.addWidget(label, 1)
+        layout.addLayout(top_bar_layout)
+
+        # Graph Buttons
+        self.tab_widget = QTabWidget()
+        self.tab2d = QWidget()
+        self.tab_widget.addTab(self.tab2d, "2D Graphs")
+        layout.addWidget(self.tab_widget)
+        
+        tab_layout = QVBoxLayout(self.tab2d)
+        analysis_layout1 = QHBoxLayout()
+        analysis_layout2 = QHBoxLayout()
+
+        self.buttons = {}
+        plot_types = {
+            'Waveform': ('waveform', analysis_layout1), 'Frequency Spectrum': ('spectrum', analysis_layout1), 'Power Spectral Density': ('psd', analysis_layout1),
+            'Spectrogram': ('spectrogram', analysis_layout2), 'Chromagram': ('chromagram', analysis_layout2), 'Tempogram': ('tempogram', analysis_layout2), 'Tonnetz': ('tonnetz', analysis_layout2)
+        }
+        for name, (ptype, btn_layout) in plot_types.items():
+            btn = QPushButton(name)
+            btn.setEnabled(False)
+            btn.clicked.connect(lambda _, p=ptype: self.select_plot_type(p))
+            btn_layout.addWidget(btn)
+            self.buttons[ptype] = btn
+        
+        tab_layout.addLayout(analysis_layout1)
+        tab_layout.addLayout(analysis_layout2)
+
+        # Plot Widgets
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        self.plot_widget_1 = pg.PlotWidget()
+        self.plot_widget_2 = pg.PlotWidget()
+        splitter.addWidget(self.plot_widget_1)
+        splitter.addWidget(self.plot_widget_2)
+        layout.addWidget(splitter)
+
+    def select_plot_type(self, ptype):
+        self.active_plot_type = ptype
+        self.draw_plots()
+
+    def select_file(self, file_num):
+        filepath, _ = QFileDialog.getOpenFileName(self, f"Select Audio File {file_num}", "", "Audio Files (*.wav *.mp3 *.flac)")
+        if filepath:
+            try:
+                self.files[file_num]['filepath'] = filepath
+                getattr(self, f"file_label_{file_num}").setText(os.path.basename(filepath))
+                self.load_audio(file_num)
+                
+                # Enable buttons if both files are loaded
+                if all('audio_data' in f for f in self.files.values()):
+                    for btn in self.buttons.values():
+                        btn.setEnabled(True)
+                    self.select_plot_type('waveform') # Default to waveform
+            except Exception as e:
+                # ... error handling ...
+                pass
+    
+    def load_audio(self, file_num):
+        file_info = self.files[file_num]
+        if 'filepath' in file_info:
+            audio_segment = AudioSegment.from_file(file_info['filepath'])
+            if audio_segment.channels > 1:
+                audio_segment = audio_segment.set_channels(1)
+            samples = np.array(audio_segment.get_array_of_samples()).astype(np.float32)
+            file_info['audio_data'] = samples / (2**(audio_segment.sample_width * 8 - 1))
+            file_info['sample_rate'] = audio_segment.frame_rate
+            file_info['plot_x_data'] = np.linspace(0, len(file_info['audio_data']) / file_info['sample_rate'], num=len(file_info['audio_data']))
+
+    def draw_plots(self):
+        if not all('audio_data' in f for f in self.files.values()):
+            return
+            
+        self.plot_widget_1.clear()
+        self.plot_widget_2.clear()
+
+        self._draw_single_plot(self.files['1'], self.plot_widget_1)
+        self._draw_single_plot(self.files['2'], self.plot_widget_2)
+        
+    def _draw_single_plot(self, file_info, plot_widget):
+        # This generic method draws the selected plot type for a given file
+        audio_data = file_info['audio_data']
+        sample_rate = file_info['sample_rate']
+        plot_x_data = file_info['plot_x_data']
+        
+        plot_widget.setTitle(f"{self.active_plot_type.capitalize()} - {os.path.basename(file_info['filepath'])}")
+        
+        if self.active_plot_type == 'waveform':
+            plot_widget.getPlotItem().setLogMode(x=False, y=False)
+            plot_item = plot_widget.plot(plot_x_data, audio_data, pen='b')
+            plot_item.setDownsampling(auto=True, method='peak')
+        # ... Add logic for all other plot types here ...
+        elif self.active_plot_type in ['spectrum', 'psd']:
+            n = len(audio_data)
+            yf = np.fft.fft(audio_data)
+            xf = np.fft.fftfreq(n, 1/sample_rate)[:n//2]
+            if self.active_plot_type == 'spectrum':
+                y_data_linear = 2.0/n * np.abs(yf[0:n//2])
+                y_data = 20 * np.log10(y_data_linear + 1e-9)
+            else:
+                psd_data = (np.abs(yf[0:n//2])**2) / (sample_rate * n)
+                y_data = 10 * np.log10(psd_data + 1e-9)
+            plot_widget.getPlotItem().setLogMode(x=True, y=False)
+            plot_widget.plot(xf, y_data, pen='k')
+        else: # 2D plots
+            data = None
+            if self.active_plot_type == 'spectrogram':
+                data = librosa.amplitude_to_db(np.abs(librosa.stft(audio_data, n_fft=self.n_fft)), ref=np.max)
+            elif self.active_plot_type == 'chromagram':
+                data = librosa.feature.chroma_stft(y=audio_data, sr=sample_rate, n_fft=self.n_fft)
+            elif self.active_plot_type == 'tempogram':
+                data = librosa.feature.tempogram(onset_envelope=librosa.onset.onset_strength(y=audio_data, sr=sample_rate), sr=sample_rate)
+            elif self.active_plot_type == 'tonnetz':
+                data = librosa.feature.tonnetz(y=librosa.effects.harmonic(audio_data), sr=sample_rate)
+            
+            if data is not None:
+                img = pg.ImageItem(image=data.T)
+                plot_widget.addItem(img)
+                duration = len(audio_data) / sample_rate
+                img.setRect(0, 0, duration, data.shape[0])
+                plot_widget.setAspectLocked(False)
+
+
+class AudioAnalyzerApp(QMainWindow):
+    """
+    The main application window that holds the side menu and stacked content.
+    """
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Audio Analyzer")
+        self.setGeometry(100, 100, 1200, 800)
+
+        self.central_widget = QSplitter(self)
+        self.setCentralWidget(self.central_widget)
+
+        self.side_menu = QListWidget()
+        self.side_menu.addItem("Single Audio Analysis")
+        self.side_menu.addItem("Dual Audio Comparison")
+        self.side_menu.setMaximumWidth(200)
+
+        self.main_content = QStackedWidget()
+        self.single_analysis_page = SingleAnalysisWidget()
+        self.dual_analysis_page = DualAnalysisWidget()
+        
+        self.main_content.addWidget(self.single_analysis_page)
+        self.main_content.addWidget(self.dual_analysis_page)
+
+        self.central_widget.addWidget(self.side_menu)
+        self.central_widget.addWidget(self.main_content)
+        self.central_widget.setSizes([150, 850])
+
+        self.side_menu.currentRowChanged.connect(self.main_content.setCurrentIndex)
+        self.side_menu.setCurrentRow(0)
+        
     def closeEvent(self, event):
-        self.stop_playback()
+        self.single_analysis_page.stop_playback()
         event.accept()
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
